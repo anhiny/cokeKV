@@ -1,9 +1,15 @@
 use crate::engine::{Engine, Result};
 use crate::wal::{Wal, WalRecord, replay_records};
+use std::path::PathBuf;
 use std::{collections::BTreeMap, path::Path};
+
+const COMPACTION_THRESHOLD: usize = 100;
 pub struct PersistentEngine {
     data: BTreeMap<Vec<u8>, Vec<u8>>,
     wal: Wal,
+    path: PathBuf,
+    record_count: usize,
+    compaction_threshold: usize,
 }
 
 impl PersistentEngine {
@@ -11,9 +17,51 @@ impl PersistentEngine {
         let path = path.as_ref();
         let wal = Wal::open(path)?;
         let records = Wal::load(path)?;
+        let record_count = records.len();
         let data = replay_records(records);
 
-        Ok(Self { data, wal })
+        Ok(Self {
+            data,
+            wal,
+            path: path.to_path_buf(),
+            record_count,
+            compaction_threshold: COMPACTION_THRESHOLD,
+        })
+    }
+
+    fn maybe_compact(&mut self) -> Result<()> {
+        if self.record_count >= self.compaction_threshold {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        let temp_path = self.path.with_extension("wal.compact");
+        let _ = std::fs::remove_file(&temp_path);
+
+        {
+            let mut compact_wal = Wal::open(&temp_path)?;
+
+            for (key, value) in self.data.iter() {
+                let record = WalRecord::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                };
+                compact_wal.append(&record)?;
+            }
+        }
+
+        std::fs::rename(&temp_path, &self.path)?;
+        self.wal = Wal::open(&self.path)?;
+        self.record_count = self.data.len();
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn temporarily_set_compaction_threshold(&mut self, threshold: usize) {
+        self.compaction_threshold = threshold;
     }
 }
 
@@ -31,12 +79,20 @@ impl Engine for PersistentEngine {
         })?;
 
         self.data.insert(key, value);
+
+        self.record_count += 1;
+        self.maybe_compact()?;
+
         Ok(())
     }
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.wal.append(&WalRecord::Delete { key: key.to_vec() })?;
 
         self.data.remove(key);
+
+        self.record_count += 1;
+        self.maybe_compact()?;
+
         Ok(())
     }
 }
@@ -124,6 +180,57 @@ mod tests {
             let engine = PersistentEngine::open(&path).unwrap();
             assert_eq!(engine.get(b"k1").unwrap(), Some(b"v2".to_vec()));
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compact_wal_test() {
+        let path = std::env::temp_dir().join("cokekv_compact_wal.log");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut engine = PersistentEngine::open(&path).unwrap();
+            engine.temporarily_set_compaction_threshold(2);
+            engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            engine.put(b"k1".to_vec(), b"v2".to_vec()).unwrap();
+        }
+
+        let records = Wal::load(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0],
+            WalRecord::Put {
+                key: b"k1".to_vec(),
+                value: b"v2".to_vec()
+            }
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compact_wal_deleted_record() {
+        let path = std::env::temp_dir().join("cokekv_compact_wal_delete_record.log");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut engine = PersistentEngine::open(&path).unwrap();
+            engine.temporarily_set_compaction_threshold(3);
+            engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+            engine.delete(b"k1").unwrap();
+        }
+
+        let records = Wal::load(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0],
+            WalRecord::Put {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec()
+            }
+        );
 
         let _ = std::fs::remove_file(&path);
     }
