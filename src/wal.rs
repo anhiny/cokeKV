@@ -126,7 +126,7 @@ impl Wal {
     pub fn append(&mut self, record: &WalRecord) -> Result<()> {
         let encoded = encode_record(record);
         self.file.write_all(&encoded)?;
-        self.file.flush()?;
+        self.file.sync_all()?;
 
         Ok(())
     }
