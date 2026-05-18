@@ -18,7 +18,7 @@ impl PersistentEngine {
         let temp_path = PersistentEngine::compact_temp_path(path);
         PersistentEngine::remove_file_if_exists(&temp_path)?;
         let wal = Wal::open(path)?;
-        let records = Wal::load(path)?;
+        let records = Wal::load_for_recovery(path)?;
         let record_count = records.len();
         let data = replay_records(records);
 
@@ -114,7 +114,7 @@ impl Engine for PersistentEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Engine;
+    use crate::{engine::Engine, wal::encode_record};
     #[test]
     fn persistent_engine_basic_behaviors() {
         let path = std::env::temp_dir().join("cokekv_persistent_basic.log");
@@ -278,6 +278,38 @@ mod tests {
         assert!(!temp_path.exists());
         assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(engine.get(b"k2").unwrap(), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recovery_with_partial_tail_wal() {
+        let path = std::env::temp_dir().join("cokekv_recovery_with_partial_tail_wal.log");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let record = WalRecord::Put {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            };
+
+            let mut bytes = encode_record(&record);
+            bytes.extend(vec![1, 2, 3]);
+
+            std::fs::write(&path, bytes).unwrap();
+        }
+
+        let engine = PersistentEngine::open(&path).unwrap();
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+
+        let bytes_after_recovery = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes_after_recovery,
+            encode_record(&WalRecord::Put {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            })
+        );
 
         let _ = std::fs::remove_file(&path);
     }

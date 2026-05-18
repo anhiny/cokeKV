@@ -108,6 +108,36 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<WalRecord>> {
     Ok(records)
 }
 
+fn decode_records_for_recovery_with_len(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
+    let mut offset: usize = 0;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        if bytes.len() - offset < HEADER_LEN {
+            break;
+        }
+        let key_len =
+            u32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        let value_len =
+            u32::from_le_bytes(bytes[offset + 5..offset + 9].try_into().unwrap()) as usize;
+
+        let record_len = HEADER_LEN + key_len + value_len;
+
+        if offset + record_len > bytes.len() {
+            break;
+        }
+        let record = decode_record(&bytes[offset..offset + record_len])?;
+        records.push(record);
+        offset += record_len;
+    }
+
+    Ok((records, offset))
+}
+
+pub fn decode_records_for_recovery(bytes: &[u8]) -> Result<Vec<WalRecord>> {
+    let (records, _) = decode_records_for_recovery_with_len(bytes)?;
+    Ok(records)
+}
+
 pub struct Wal {
     file: std::fs::File,
 }
@@ -134,6 +164,20 @@ impl Wal {
     pub fn load(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
         let bytes = std::fs::read(path)?;
         decode_records(&bytes)
+    }
+
+    pub fn load_for_recovery(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
+        let bytes = std::fs::read(&path)?;
+        let original_len = bytes.len();
+        let (records, valid_len) = decode_records_for_recovery_with_len(&bytes)?;
+
+        if valid_len < original_len {
+            let fs = OpenOptions::new().write(true).open(&path)?;
+            fs.set_len(valid_len as u64)?;
+            fs.sync_all()?;
+        }
+
+        Ok(records)
     }
 }
 
@@ -378,5 +422,43 @@ mod tests {
         let data = replay_records(records);
 
         assert!(data.get(b"k1".as_slice()).is_none());
+    }
+
+    #[test]
+    fn decode_records_for_recovery_ignores_partial_header_tail() {
+        let record = WalRecord::Put {
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+        };
+
+        let mut bytes = encode_record(&record);
+        bytes.extend(vec![1, 2, 3]);
+
+        let records = decode_records_for_recovery(&bytes).unwrap();
+        assert_eq!(records, vec![record]);
+    }
+
+    #[test]
+    fn decode_records_for_recovery_ignores_partial_payload_tail() {
+        let mut bytes = Vec::new();
+        bytes.push(RECORD_TYPE_PUT);
+        bytes.extend(2u32.to_le_bytes());
+        bytes.extend(2u32.to_le_bytes());
+        bytes.extend(b"k1");
+        bytes.extend(b"v");
+
+        let records = decode_records_for_recovery(&bytes).unwrap();
+
+        assert_eq!(records, Vec::new());
+    }
+
+    #[test]
+    fn decode_records_for_recovery_rejects_unknown_complete_record() {
+        let mut bytes = Vec::new();
+        bytes.push(99);
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+
+        assert!(decode_records_for_recovery(&bytes).is_err());
     }
 }
