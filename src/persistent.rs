@@ -15,6 +15,8 @@ pub struct PersistentEngine {
 impl PersistentEngine {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let temp_path = PersistentEngine::compact_temp_path(path);
+        PersistentEngine::remove_file_if_exists(&temp_path)?;
         let wal = Wal::open(path)?;
         let records = Wal::load(path)?;
         let record_count = records.len();
@@ -37,8 +39,8 @@ impl PersistentEngine {
     }
 
     fn compact(&mut self) -> Result<()> {
-        let temp_path = self.path.with_extension("wal.compact");
-        let _ = std::fs::remove_file(&temp_path);
+        let temp_path = PersistentEngine::compact_temp_path(&self.path);
+        PersistentEngine::remove_file_if_exists(&temp_path)?;
 
         {
             let mut compact_wal = Wal::open(&temp_path)?;
@@ -57,6 +59,18 @@ impl PersistentEngine {
         self.record_count = self.data.len();
 
         Ok(())
+    }
+
+    fn compact_temp_path(path: &Path) -> PathBuf {
+        path.with_extension("wal.compact")
+    }
+
+    fn remove_file_if_exists(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     #[cfg(test)]
@@ -231,6 +245,39 @@ mod tests {
                 value: b"v2".to_vec()
             }
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_remove_temp_wal_in_open_and_compact() {
+        let path = std::env::temp_dir().join("cokekv_auto_remove.log");
+        let temp_path = PersistentEngine::compact_temp_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&temp_path);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&WalRecord::Put {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            })
+            .unwrap();
+
+            let mut wal_temp = Wal::open(&temp_path).unwrap();
+            wal_temp
+                .append(&WalRecord::Put {
+                    key: b"k2".to_vec(),
+                    value: b"v2".to_vec(),
+                })
+                .unwrap();
+        }
+
+        let engine = PersistentEngine::open(&path).unwrap();
+
+        assert!(!temp_path.exists());
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get(b"k2").unwrap(), None);
 
         let _ = std::fs::remove_file(&path);
     }
